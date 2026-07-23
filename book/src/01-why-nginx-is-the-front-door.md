@@ -147,24 +147,122 @@ Range: bytes=-18446744073709551615, -1
 **危害等级**：高（CVSS 7.7）
 **触发条件**：Nginx 配置 `resolver` 指令 + 攻击者控制 DNS 响应
 
-**原理简述**：`resolver` 指令用于 upstream 域名解析。攻击者通过 DNS 响应中的特定 payload 触发 off-by-one 漏洞，进而在 Nginx worker 进程里执行代码。
+#### 1. 起点：那一行 AAAA 到底写了什么
 
-**PoC（DNS 响应）**：
+`resolver` 指令用来在运行时把 upstream 的域名解析成 IP。攻击者要做的事只有一件：**让 Nginx 解析自己控制的 DNS 响应**。下面这行就是他们的"投毒样本"：
 
 ```
 ;; ANSWER SECTION:
 target.attacker.com.  60  IN  AAAA  ::ffff:2678.4649.4649.4649.4649.4649.4649.4649.4649
 ```
 
-`4649` = 0x4649 = 字节序列"FI"（F = 0x46, I = 0x49）→ 触发 off-by-one 写入。
+逐段拆开看：
 
-**为什么这 CVE 让我后背发凉**：
+| 片段 | 含义 | 攻击作用 |
+|---|---|---|
+| `target.attacker.com.` | 攻击者控制的域名（用于把"投毒"对到合法 upstream） | 让受害 Nginx 把它当作"真实 upstream IP"缓存 |
+| `60` | TTL 60 秒 | 短 TTL 让"假 IP"被 worker 频繁复用 |
+| `AAAA` | IPv6 记录 | 走 nginx 的 IPv6 解析路径 `ngx_resolver_copy()` |
+| `::ffff:` | RFC 4291 的 IPv4-mapped IPv6 前缀 | 让 nginx "以为是 IPv6，实际是 IPv4" |
+| `2678.4649.4649.4649.4649.4649.4649.4649.4649` | IPv6 dotted-quad 畸形写法（RFC 2673） | **核心载荷**，让 `ngx_resolver_copy()` 算错长度 |
 
-- RCE（远程代码执行），可拿到 Nginx worker 权限
-- 攻击载荷藏在 DNS 响应里，**HTTP 日志看不到任何异常**
-- 当时国内 30%+ 的 Nginx 部署中招（因为阿里云 SLB / 七牛 CDN 默认配置用了 resolver）
+把后面那一段 **以十六进制看** 就是：
 
-**修复**：升级到 1.20.1+，或禁用 resolver 用 IP 直连 upstream。
+```
+2678      →  0x2678              （普通 IPv4 段，无攻击意义）
+4649 × 8  →  0x46 0x49  重复 8 次  →  ASCII "FI""FI""FI""FI""FI""FI""FI""FI"
+```
+
+也就是说，那一长串其实是 **8 个 `4649`（"FI"）** 拼接起来。这不是巧合：
+
+- `F = 0x46`、`I = 0x49`，**双双落在 ASCII 可打印区**，不会被 nginx 的"过滤非打印字符"逻辑挡掉；
+- 这 8 段刚好填满 IPv6 的 8 个 16-bit group，触发 `ngx_resolver_copy()` 走**最长拼接路径**；
+- 一旦后续写入再夹一个 `'.'`（0x2E），就**精确踩过 1 字节**——这正是 off-by-one 的"恶意 payload"。
+
+#### 2. 漏洞核心：`ngx_resolver_copy()` 的 off-by-one
+
+`ngx_resolver_copy()` 负责把 DNS 报文里的压缩域名**解压并拷贝**到一块新分配的堆缓冲区。函数内部做了两件事：
+
+```c
+// 第一遍：遍历 DNS 报文，计算"解压后的字符串长度"
+for (p = src; *p != '\0'; ) {
+    if (*p & 0xc0) {            // 遇到压缩指针 (RFC 1035 4.1.4)
+        /* 跳过指针 */
+        break;
+    }
+    n = *p++;                   // n = 当前 label 长度
+    len += n + 1;               // ← 只算 "label 字节数 + 1 个分隔点"
+    p += n;
+}
+
+// 第二遍：按相同路径，把解压结果拷贝到 name->data
+for (p = src; *p != '\0'; ) {
+    /* 同上逻辑 */
+    *dst++ = *p++;              // 拷贝 label 字节
+    *dst++ = '.';               // ← 在 label 间插入一个点号
+    dst += n;
+}
+```
+
+**长度计算漏掉一件事**：当最后一个 label 走的是压缩指针 → 指向 **NUL 字节** 时：
+
+- 第一遍：`len` 只算了"前面 label 的长度 + 中间的点号"，**没算末尾那个 NUL 终止符**；
+- 第二遍：解压结束前，nginx 仍然会**写一个 `'.'`（0x2E）**，写到了 `name->data[len]` —— 这个位置**正好比分配的堆缓冲区多 1 字节**。
+
+```
+分配的缓冲区：[ name 字节 ... ][ next-chunk metadata ]
+                 ↑ len
+                                     ↑ 写入了 0x2E (1 字节越界)
+```
+
+那 1 字节 **`0x2E`（点号）**，就覆盖了下一块堆 chunk 的 **size | flags** 字段的最低字节。攻击者只要精心控制 AAAA 字符串的总长度，让 `len` 对齐到 glibc ptmalloc2 的 chunk 边界（通常是 0x10 / 0x20 对齐），就能稳定改写下一块的 `PREV_INUSE` 位、`IS_MMAPPED` 位。
+
+#### 3. 从 1 字节到 RCE：完整的攻击链
+
+```text
+┌────────────────────────────────────────────────────────────────┐
+│ 攻击者                                                            │
+│   1. 在公网自建伪造 DNS（53/UDP）                                   │
+│   2. 构造 AAAA 响应，载荷用 ::ffff:2678.4649.4649...              │
+│   3. 对受害 Nginx 持续重放投毒响应（无需猜 Transaction ID：         │
+│      nginx 在 ngx_resolver_copy 之前才校验 ID，函数本身已经被调用）│
+└────────────────────────────────────────────────────────────────┘
+                            ▼
+┌────────────────────────────────────────────────────────────────┐
+│ 受害 Nginx worker                                                  │
+│   ngx_resolver_copy() 写入 name->data[len] = 0x2E                │
+│                          ↓                                       │
+│   1 字节越界改写下一堆块的 size | flags                           │
+│                          ↓                                       │
+│   后续 worker 处理请求时 malloc/free 触发 unlink 链畸变           │
+│                          ↓                                       │
+│   通过 house-of-xxx / tcache poisoning 把 free() 指向              │
+│   攻击者控制的 "伪 chunk"（其内容已经在 DNS 响应里传入）            │
+│                          ↓                                       │
+│   __free_hook / 虚函数指针 → 跳到 attacker payload                │
+│                          ↓                                       │
+│   Nginx worker 进程内任意代码执行（RCE）                          │
+└────────────────────────────────────────────────────────────────┘
+```
+
+> **关键点**：这一整条链，**HTTP 层没有任何异常**。Access log 不会记录 DNS 内容，error log 也只会看到 worker 重启——很多团队直到 worker 反复被替换才意识到被攻击。
+
+#### 4. 为什么这 CVE 让我后背发凉
+
+- **RCE**（远程代码执行），最差可拿到 worker → master → root 链路；
+- **HTTP 日志全静默**：攻击载荷藏在 53/UDP 报文里，access/error log 完全看不到；
+- **国内 30%+ Nginx 部署中招**：阿里云 SLB / 七牛 CDN / 自建网关默认用 `resolver`；
+- **PoC 极轻**：一个伪造 DNS server + 一行 AAAA 记录 + 几次重放即可触发。
+
+#### 5. 修复与防御
+
+| 措施 | 操作 |
+|---|---|
+| 升级 Nginx | **≥ 1.20.1（stable） / ≥ 1.21.0（mainline）**；官方补丁在 `ngx_resolver_copy()` 里加了 `len++` 把末尾 NUL 算进去 |
+| upstream 用 IP 直连 | `proxy_pass http://10.0.0.1:8080;`（不要用域名 → 不用 resolver） |
+| resolver 收窄信任源 | `resolver 10.0.0.53 valid=30s;` —— 只信内网可控 DNS；**不要用公网 8.8.8.8 / 1.1.1.1**（最容易被投毒）|
+| 收敛响应窗口 | `resolver_timeout 5s;` + `resolver 127.0.0.1:5353 valid=10s;`（自建 unbound + cache）|
+| eBPF 校验 | 在 53/UDP ingress 跑 eBPF，丢弃任何 rcode=NOERROR 但 qtype=AAAA 却返回畸形 IPv6 字符串的响应 |
 
 ### Mercure.ro 2024：Nginx 配置错误 → 百万用户数据泄露
 
@@ -192,7 +290,60 @@ curl https://target.com/static../etc/passwd
 
 - Nginx 配置中的"小斜杠"错误（`/static/` vs `/static`）会直接导致目录遍历
 - 自动化扫描器（如 [gixy](https://github.com/yandex/gixy)）能静态检测这种问题
-- PCI DSS 4.0 已把"Nginx 配置审计"列为强制要求
+- **PCI DSS 4.0** 已把"Nginx 配置审计"列为强制要求（见下面展开）
+
+**PCI DSS 4.0 对 Nginx 配置审计的强制要求（2025-03-31 生效）**
+
+PCI DSS v4.0 在 **Requirement 2.2.5** 把这一条收紧为强制审计项：
+
+> *"Misconfigurations or insecure defaults, including but not limited to unnecessary services, default accounts, sample files, and insecure protocol versions, must be identified and remediated."*
+
+落到 Nginx 上，**必须能在审计中拿出证据**（不是"我们 review 过"，而是"工具跑过 + 问题闭环"）：
+
+| PCI DSS 4.0 控制项 | 对应 Nginx 实践 | 推荐工具 |
+|---|---|---|
+| 2.2.5 不安全默认/误配 | `server_tokens off`、`ssl_protocols TLSv1.2 TLSv1.3 only`、禁 `merge_slashes off` 之外的所有路径规范化 | `gixy`、`nginx-config-formatter` |
+| 2.2.7 最小功能原则 | 移除 `ngx_http_autoindex_module`、`ngx_http_dav_module`、`ngx_http_ssi_module` 等用不到的模块 | `nginx -V` 比对 build options |
+| 4.2.1 强加密传输 | TLS 1.2+、禁用 3DES/RC4、禁用 SSLv3 | `testssl.sh`、`openssl s_client` |
+| 6.4.3 Web 应用攻击面 | 静态扫描 WAF 规则覆盖 OWASP Top 10 | ModSecurity CRS / Coraza |
+| 10.x 可审计日志 | access_log / error_log 接入 SIEM，保留 ≥ 12 个月 | Filebeat → Elasticsearch |
+| 11.5.2 文件完整性 | `nginx.conf` / `/etc/nginx/conf.d/*.conf` 接入 AIDE / OSSEC | AIDE、Tripwire |
+
+**最小可行的"黄金 nginx.conf"片段**（同时满足 PCI DSS 4.0 + OWASP WSTG-CONF）：
+
+```nginx
+http {
+    server_tokens off;                           # PCI DSS 2.2.5：不暴露版本
+    ssl_protocols TLSv1.2 TLSv1.3;               # PCI DSS 4.2.1：禁用老旧协议
+    ssl_prefer_server_ciphers on;
+    ssl_ciphers 'ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384';
+
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "no-referrer" always;
+
+    limit_req_zone $binary_remote_addr zone=req:10m rate=10r/s;  # 抗 Slowloris
+
+    server {
+        listen 443 ssl http2;
+        location /server-status { deny all; }     # PCI DSS 6.4.3：内部接口不对外
+        location ~ /\.git { deny all; }           # PCI DSS 6.4.3：源码目录隐藏
+    }
+}
+```
+
+**审计证据链**（PCI DSS 审计员必看三件套）：
+
+1. **CI 跑 `gixy`**（每 PR 一次，报告存 12 个月）→ 证明配置在变更是经过静态扫描的；
+2. **定期 `testssl.sh`**（季度一次，HTML 报告归档）→ 证明加密配置没有回退；
+3. **`nginx -T` 输出入库**（每月一次，diff 上一次）→ 证明运行时配置可追溯。
+
+**本章只埋点，深度展开见后续章节**：
+
+- 第 5 章 `## 案例 3：金融合规——PCI DSS 4.0 要求下的 Nginx 部署`（已存在）给出一个真实持牌支付机构的全套合规实践；
+- 第 6 章 `### 静态分析：gixy`（已存在）展开 `gixy` 在 CI 中的接入方式、JSON 报告解读、与 OPA/Conftest 的组合；
+- 附录 B `## B.8 gixy 配置 lint 集成进 CI`（已存在）给出可复制粘贴的 GitHub Actions workflow。
 
 ### Cloudflare 2023：Nginx 模块漏洞 → 全网 CDN 受影响
 
