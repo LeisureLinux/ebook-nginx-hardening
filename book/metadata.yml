@@ -1,0 +1,36 @@
+---
+title: "Nginx 纵深加固：从反向代理到 WAF 实战"
+subtitle: "Nginx Defense in Depth — From Reverse Proxy to WAF in Production"
+author: "LeisureLinux"
+date: "2026年7月"
+lang: "zh-CN"
+publisher: "LeisureLinux"
+subject:
+  - "Linux"
+  - "Security"
+  - "Nginx"
+  - "Reverse Proxy"
+  - "WAF"
+  - "TLS"
+keywords:
+  - "nginx"
+  - "reverse-proxy"
+  - "waf"
+  - "tls"
+  - "mtls"
+  - "hardening"
+  - "modsecurity"
+  - "openresty"
+  - "kong"
+  - "apisix"
+description: |
+  把 Nginx 当成一座"互联网城门"——它既是性能最快的反向代理，
+  也是攻击者最爱的隐身舞台。本书从 Nginx 的本质（事件驱动 + 异步非阻塞）
+  讲起，沿着攻击者五步路径展开（摸配置 → 找路径 → 绕认证 → 提权 → 隐攻击），
+  再用五层纵深防御守住每一道门（暴露面 / 访问控制 / 行为约束 / 完整性 / 可观测性）。
+  最后覆盖 TLS 1.3 / mTLS / API 网关 / CDN / 灰度发布 / 自动化等高级主题，
+  给读者一套生产环境可落地的完整方案。
+rights: "© 2026 LeisureLinux. Released under MIT License."
+ibooks:
+  version: 1.0.0
+...

@@ -1,0 +1,175 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write   # for gh-pages action / release
+  pages: write      # for deploy-pages
+  id-token: write   # required by deploy-pages (OIDC)
+
+jobs:
+  build:
+    name: Build PDF / ePub / HTML
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history so render_colophon can git log
+
+      - name: Render colophon (version + changelog + history)
+        run: python3 scripts/render_colophon.py
+
+      - name: Install pandoc + librsvg + python3 (for cover SVG→PNG)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pandoc python3 librsvg2-bin
+          pandoc --version | head -1
+          rsvg-convert --version
+
+      - name: Install TeX Live (XeLaTeX) + CJK fonts
+        run: |
+          sudo apt-get install -y --no-install-recommends \
+            texlive-xetex \
+            texlive-latex-recommended \
+            texlive-latex-extra \
+            texlive-fonts-recommended \
+            texlive-fonts-extra \
+            texlive-lang-chinese \
+            fonts-noto-cjk \
+            fonts-noto-cjk-extra \
+            fontconfig \
+            lmodern
+
+      - name: Show tool versions
+        run: |
+          pandoc --version | head -1
+          xelatex --version | head -1
+          fc-list :lang=zh-cn | head -5
+
+      - name: Build PDF
+        run: |
+          mkdir -p dist
+          cd book
+          pandoc \
+            --pdf-engine=xelatex \
+            --metadata-file=metadata.yml \
+            --include-in-header=theme/latex-header.tex \
+            --toc --toc-depth=2 \
+            --number-sections \
+            --from=markdown+smart+footnotes+raw_attribute \
+            --resource-path=src \
+            -V documentclass=book \
+            -V papersize=a4 \
+            src/00-preface.md \
+            src/01-*.md \
+            src/02-*.md \
+            src/03-*.md \
+            src/04-*.md \
+            src/05-*.md \
+            src/06-*.md \
+            src/07-*.md \
+            src/99-*.md \
+            -o ../dist/nginx-hardening.pdf
+
+      - name: Render cover SVG → PNG (with CJK font)
+        run: |
+          cd book
+          # Re-render cover.svg using rsvg-convert so CJK glyphs render
+          # correctly. fontconfig picks up the system Noto Serif CJK SC
+          # we installed in the LaTeX/CJK fonts step above.
+          rsvg-convert -w 1200 -h 1600 cover.svg -o cover.png
+          ls -la cover.png
+
+      - name: Build ePub
+        run: |
+          mkdir -p dist
+          cd book
+          pandoc \
+            --to=epub3 \
+            --metadata-file=metadata.yml \
+            --css=theme/epub.css \
+            --toc --toc-depth=3 \
+            --number-sections \
+            --from=markdown+smart+footnotes+raw_attribute \
+            --resource-path=src \
+            --epub-cover-image=cover.png \
+            src/00-preface.md \
+            src/01-*.md \
+            src/02-*.md \
+            src/03-*.md \
+            src/04-*.md \
+            src/05-*.md \
+            src/06-*.md \
+            src/07-*.md \
+            src/99-*.md \
+            -o ../dist/nginx-hardening.epub
+
+      - name: Strip ePub landmarks nav (post-processing)
+        run: python3 scripts/strip_landmarks.py
+
+      - name: Build HTML (standalone)
+        run: |
+          mkdir -p dist
+          cd book
+          pandoc \
+            --to=html5 --standalone \
+            --metadata-file=metadata.yml \
+            --toc --toc-depth=3 \
+            --number-sections \
+            --from=markdown+smart+footnotes+raw_attribute \
+            --resource-path=src \
+            --css=theme/html.css \
+            --self-contained \
+            src/00-preface.md \
+            src/01-*.md \
+            src/02-*.md \
+            src/03-*.md \
+            src/04-*.md \
+            src/05-*.md \
+            src/06-*.md \
+            src/07-*.md \
+            src/99-*.md \
+            -o ../dist/nginx-hardening.html
+
+      - name: Prepare GitHub Pages site
+        run: |
+          mkdir -p site
+          cp dist/nginx-hardening.pdf  site/nginx-hardening.pdf
+          cp dist/nginx-hardening.epub site/nginx-hardening.epub
+          cp dist/nginx-hardening.html site/nginx-hardening.html
+          cp book/theme/landing.html  site/index.html
+
+      - name: Upload Pages artifact (always)
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Deploy to GitHub Pages
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Upload build artifacts (PDF + ePub)
+        uses: actions/upload-artifact@v4
+        with:
+          name: nginx-hardening-${{ github.ref_name }}
+          path: |
+            dist/nginx-hardening.pdf
+            dist/nginx-hardening.epub
+          retention-days: 30
+
+      - name: Attach to GitHub Release (on tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            dist/nginx-hardening.pdf
+            dist/nginx-hardening.epub
