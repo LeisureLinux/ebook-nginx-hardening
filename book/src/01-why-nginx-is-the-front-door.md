@@ -77,6 +77,78 @@ while (1) {
 }
 ```
 
+#### epoll/kqueue：内核级事件通知到底做了什么
+
+`epoll`（Linux）和 `kqueue`（BSD / macOS）是 Nginx 高并发的真正引擎。要理解它为什么重要，先把它和"上一代 IO 多路复用"对照：
+
+**1. 从 select / poll 到 epoll 的演进**
+
+| API | 平台 | 时间复杂度 | fd 上限 | 关键缺陷 |
+|---|---|---|---|---|
+| `select` | 全部 POSIX | 每次 O(N)，N = 最大 fd | FD_SETSIZE（Linux 默认 1024） | 每次要把 fd_set 从用户态拷到内核态，再拷回来 |
+| `poll` | 全部 POSIX | 每次 O(N) | 无（链表） | 同样每次全量遍历 + 拷贝；fd 多时性能雪崩 |
+| `epoll` | Linux ≥ 2.5.44 | 注册 O(1)，等待 O(M)，M = 就绪 fd | 系统 fd 上限（百万级） | **只在 Linux** |
+| `kqueue` | BSD / macOS | 注册 O(1)，等待 O(M) | 同 epoll | **不在 Linux** |
+
+Nginx 在编译期自动检测：`ngx_os.h` 里如果找到 `<sys/epoll.h>` 就走 epoll，找不到就退到 kqueue 或 select（性能兜底）。
+
+**2. epoll 的两个 syscall**
+
+epoll 把"事件订阅"和"事件等待"拆开，避开了 select/poll 的全量拷贝：
+
+```c
+// 1. 创建 epoll 实例（master 进程初始化一次）
+int epfd = epoll_create(1024);
+
+// 2. 注册关注的 fd（连接 accept / listen socket / upstream fd）
+struct epoll_event ev;
+ev.events = EPOLLIN | EPOLLET;        // 读事件 + 边缘触发
+ev.data.ptr = conn;
+epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
+
+// 3. 等待事件（worker 主循环）
+while (1) {
+    int n = epoll_wait(epfd, events, MAX_EVENTS, -1);   // 阻塞
+    for (int i = 0; i < n; i++) {
+        handle_event(&events[i]);      // 只处理"就绪"的 fd，O(M)
+    }
+}
+```
+
+**关键点**：内核维护一棵**红黑树**记录"被监视的 fd"，一份**就绪链表**记录"已就绪的 fd"。`epoll_wait` 直接从就绪链表取，**不需要遍历所有 fd**。这就是 Nginx 单 worker 扛 10 万连接的根因。
+
+**3. LT vs ET：Nginx 默认选哪种触发模式**
+
+| 模式 | 含义 | Nginx 默认 | 风险 |
+|---|---|---|---|
+| **LT（Level Triggered，水平触发）** | fd 只要还"就绪"，每次 `epoll_wait` 都会回报它 | ✅ 是 | 容错好——某次忘了读，下一轮还会被通知 |
+| **ET（Edge Triggered，边缘触发）** | 只在 fd 状态变化那一瞬回报一次 | ❌ 否（除非显式 `EPOLLET`） | 漏读就丢事件——必须配合 `fcntl(O_NONBLOCK)` + 循环读到 `EAGAIN` |
+
+Nginx 默认 LT 是工程权衡：**安全 > 极限性能**。ET 模式虽然更快，但漏一次读就丢连接——对一个公网 Web 服务器来说，丢一个 HTTP 请求比慢 5% 严重得多。
+
+**4. kqueue：BSD/macOS 上的对应实现**
+
+FreeBSD / macOS 上 Nginx 走 `kqueue` + `kevent`，API 形态几乎一致：
+
+```c
+int kq = kqueue();
+struct kevent ev;
+EV_SET(&ev, fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
+kevent(kq, &ev, 1, NULL, 0, NULL);    // 注册
+while (1) {
+    int n = kevent(kq, NULL, 0, events, MAX_EVENTS, NULL);  // 等待
+    // ...
+}
+```
+
+底层 BSD kernel 用同一个调度器同时处理 kqueue 和网络栈，**比 Linux epoll 还略快**（FreeBSD 的网络栈历来是业界标杆）。这也是 Netflix 的 FreeBSD 边缘节点、Cloudflare 部分节点至今不切 Linux 的原因之一。
+
+**5. 这层抽象对安全意味着什么**
+
+- **连接耗尽攻击更难**：因为内核只回报"就绪 fd"，攻击者用 SYN flood 把半开连接塞满并不会让 epoll_wait 变慢——它压根不返回这些 fd；
+- **Slowloris 仍然有效**：Nginx worker 是单线程事件循环，**一个 Slowloris 连接慢慢读 body 占住 worker 不放**，所有同 worker 上的请求都跟着卡。修复是 `client_header_timeout` / `client_body_timeout` / `limit_req_zone`；
+- **fd 泄漏能拖垮 worker**：第三方模块忘记 `epoll_ctl(EPOLL_CTL_DEL)` 关闭 fd，进程 fd 表涨满后 `accept()` 返回 `EMFILE`——worker 死亡、master 拉新 worker 顶上，循环崩。这正是 CVE-2013-2028（chunked encoding 重复 `$size` 触发 fd 泄漏）那一类 bug 的根因。
+
 **关键差异**：
 
 | | Apache prefork | Nginx |
